@@ -76,6 +76,84 @@ function parseJsonObject(value) {
     }
 }
 
+function providerLabel(provider) {
+    const labels = {
+        openai: 'OpenAI OCR',
+        anthropic: 'Claude OCR',
+        huggingface: 'HuggingFace OCR',
+        generic: 'Generic OCR',
+        local: 'Local OCR'
+    };
+
+    return labels[String(provider || '').toLowerCase()] || String(provider || 'Provider');
+}
+
+function providerErrorMessage(responseBody, statusCode = null) {
+    const text = String(responseBody || '').trim();
+    if (!text) {
+        return statusCode ? `Provider request failed with HTTP ${statusCode}.` : 'Provider request failed.';
+    }
+
+    const parsed = parseJsonObject(text);
+    const errorPayload = parsed && parsed.error ? parsed.error : parsed;
+    const code = errorPayload && errorPayload.code ? String(errorPayload.code) : '';
+    const message = errorPayload && errorPayload.message
+        ? String(errorPayload.message)
+        : (parsed && parsed.message ? String(parsed.message) : text);
+    const modelMatch = message.match(/model '([^']+)'/i);
+
+    if (code === 'model_not_supported' && modelMatch) {
+        return `The selected model ${modelMatch[1]} is not supported by your enabled HuggingFace providers. Choose a supported vision-capable model or enable a provider for this model in HuggingFace.`;
+    }
+
+    if (code === 'model_not_supported') {
+        return 'The selected HuggingFace model is not supported by your enabled providers. Choose a supported vision-capable model or enable a provider for this model in HuggingFace.';
+    }
+
+    return message;
+}
+
+function cleanEndpoint(value) {
+    return String(value || '').trim().replace(/\/+$/, '');
+}
+
+function isOpenAiCompatibleEndpoint(endpoint) {
+    const normalized = cleanEndpoint(endpoint);
+    return /\/v1(?:\/chat\/completions)?$/i.test(normalized) ||
+        /router\.huggingface\.co/i.test(normalized);
+}
+
+function chatCompletionsEndpoint(endpoint, fallbackBase) {
+    const normalized = cleanEndpoint(endpoint || fallbackBase);
+    if (/\/chat\/completions$/i.test(normalized)) {
+        return normalized;
+    }
+
+    return `${normalized}/chat/completions`;
+}
+
+function extractChatCompletionText(parsed) {
+    const choice = parsed && parsed.choices && parsed.choices[0];
+    const message = choice && choice.message;
+
+    if (!message) {
+        return '';
+    }
+
+    if (typeof message.content === 'string') {
+        return message.content;
+    }
+
+    if (Array.isArray(message.content)) {
+        return message.content
+            .map(part => typeof part === 'string' ? part : (part && (part.text || part.content) || ''))
+            .filter(Boolean)
+            .join('\n');
+    }
+
+    return '';
+}
+
 function runCommand(command, args = [], options = {}) {
     return new Promise((resolve, reject) => {
         const timeoutMs = options.timeoutMs || COMMAND_TIMEOUT_MS;
@@ -163,7 +241,7 @@ function postRequest(urlString, { headers = {}, body = null, timeoutMs = REQUEST
             response.on('end', () => {
                 const responseBody = Buffer.concat(chunks).toString('utf8');
                 if (response.statusCode < 200 || response.statusCode >= 300) {
-                    reject(new Error(`Provider request failed with HTTP ${response.statusCode}: ${responseBody.slice(0, 300)}`));
+                    reject(new Error(providerErrorMessage(responseBody, response.statusCode)));
                     return;
                 }
 
@@ -233,26 +311,85 @@ async function extractPdfText(filePath) {
     return result.stdout;
 }
 
-async function ocrImage(filePath, settings) {
-    const remoteText = await remoteOcrImage(filePath, settings).catch(error => {
-        console.error('Remote OCR failed, falling back to local Tesseract:', error.message);
-        return '';
-    });
-
-    if (remoteText) {
-        return remoteText;
-    }
-
+async function runTesseract(filePath, language, extraArgs = []) {
     const result = await runCommand('tesseract', [
         filePath,
         'stdout',
         '-l',
-        settings.ocr.language || 'eng'
+        language || 'eng',
+        ...extraArgs
     ]);
     return result.stdout;
 }
 
-async function ocrPdf(filePath, settings, workDir) {
+function getOcrConnection(settings) {
+    return {
+        type: settings.ocr.provider || 'local',
+        apiKey: settings.ocr.apiKey || settings.provider.apiKey || '',
+        endpoint: settings.ocr.endpoint || '',
+        model: settings.ocr.model || settings.provider.model || ''
+    };
+}
+
+function validateRemoteOcrConnection(connection) {
+    if (connection.type === 'generic') {
+        if (!connection.endpoint) {
+            throw new Error('Generic OCR is configured but no endpoint was provided.');
+        }
+        return;
+    }
+
+    if (!connection.apiKey) {
+        throw new Error(`${connection.type} OCR is configured but no API key was provided.`);
+    }
+
+    if (connection.type === 'huggingface' && !connection.model && !connection.endpoint) {
+        throw new Error('HuggingFace OCR is configured but no model or endpoint was provided.');
+    }
+}
+
+async function ocrImage(filePath, settings, ocrMetadata = {}) {
+    const connection = getOcrConnection(settings);
+    ocrMetadata.ocrProvider = connection.type;
+    ocrMetadata.ocrModel = connection.model || null;
+    ocrMetadata.ocrFallbackApplied = false;
+    ocrMetadata.ocrError = null;
+
+    if (connection.type !== 'local') {
+        try {
+            validateRemoteOcrConnection(connection);
+            const remoteText = await remoteOcrImage(filePath, settings);
+            if (normalizeWhitespace(remoteText)) {
+                return remoteText;
+            }
+
+            throw new Error(`${connection.type} OCR returned no extracted text.`);
+        } catch (error) {
+            const message = `${providerLabel(connection.type)} failed: ${error.message || 'Unknown provider error.'}`;
+            ocrMetadata.ocrError = message;
+            throw new Error(message);
+        }
+    }
+
+    ocrMetadata.ocrProvider = 'local';
+    ocrMetadata.ocrModel = 'tesseract';
+    const language = settings.ocr.language || 'eng';
+    const defaultText = await runTesseract(filePath, language);
+    const normalizedDefault = normalizeWhitespace(defaultText);
+
+    if (normalizedDefault.length >= 5) {
+        return defaultText;
+    }
+
+    const sparseText = await runTesseract(filePath, language, ['--psm', '11']).catch(error => {
+        console.error('Sparse OCR fallback failed:', error.message);
+        return '';
+    });
+
+    return normalizeWhitespace(sparseText).length > normalizedDefault.length ? sparseText : defaultText;
+}
+
+async function ocrPdf(filePath, settings, workDir, ocrMetadata = {}) {
     const pagesDir = path.join(workDir, 'ocr-pages');
     await fs.ensureDir(pagesDir);
     const outputPrefix = path.join(pagesDir, 'page');
@@ -272,7 +409,7 @@ async function ocrPdf(filePath, settings, workDir) {
     const textParts = [];
 
     for (const pageFile of pageFiles) {
-        textParts.push(await ocrImage(pageFile, settings));
+        textParts.push(await ocrImage(pageFile, settings, ocrMetadata));
     }
 
     return textParts.join('\n\n');
@@ -307,6 +444,8 @@ async function extractOfficeText(filePath, workDir) {
 }
 
 async function extractContent(file, filePath, capability, settings, workDir) {
+    const ocrMetadata = {};
+
     if (capability.category === 'text') {
         return { text: await readTextFile(filePath, settings.limits.maxTextChars), method: 'text', ocrApplied: false };
     }
@@ -317,11 +456,12 @@ async function extractContent(file, filePath, capability, settings, workDir) {
             return { text: nativeText, method: 'pdf-text', ocrApplied: false };
         }
 
-        const ocrText = await ocrPdf(filePath, settings, workDir);
+        const ocrText = await ocrPdf(filePath, settings, workDir, ocrMetadata);
         return {
             text: normalizeWhitespace([nativeText, ocrText].filter(Boolean).join('\n\n')),
             method: nativeText ? 'pdf-text+ocr' : 'pdf-ocr',
-            ocrApplied: true
+            ocrApplied: true,
+            ...ocrMetadata
         };
     }
 
@@ -330,7 +470,7 @@ async function extractContent(file, filePath, capability, settings, workDir) {
             return { text: '', method: 'image-metadata', ocrApplied: false };
         }
 
-        return { text: await ocrImage(filePath, settings), method: 'image-ocr', ocrApplied: true };
+        return { text: await ocrImage(filePath, settings, ocrMetadata), method: 'image-ocr', ocrApplied: true, ...ocrMetadata };
     }
 
     if (capability.category === 'office') {
@@ -341,12 +481,7 @@ async function extractContent(file, filePath, capability, settings, workDir) {
 }
 
 async function remoteOcrImage(filePath, settings) {
-    const connection = {
-        type: settings.ocr.provider || 'local',
-        apiKey: settings.ocr.apiKey || settings.provider.apiKey || '',
-        endpoint: settings.ocr.endpoint || '',
-        model: settings.ocr.model || settings.provider.model || ''
-    };
+    const connection = getOcrConnection(settings);
     const canUseRemote = connection.type === 'generic' ? !!connection.endpoint : !!connection.apiKey;
 
     if (connection.type === 'local' || !canUseRemote) {
@@ -405,6 +540,28 @@ async function remoteOcrImage(filePath, settings) {
     }
 
     if (connection.type === 'huggingface') {
+        if (isOpenAiCompatibleEndpoint(connection.endpoint)) {
+            if (!connection.model) {
+                return '';
+            }
+
+            const raw = await postRequest(chatCompletionsEndpoint(connection.endpoint, 'https://router.huggingface.co/v1'), {
+                headers: { Authorization: `Bearer ${connection.apiKey}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    model: connection.model,
+                    temperature: 0,
+                    messages: [{
+                        role: 'user',
+                        content: [
+                            { type: 'text', text: prompt },
+                            { type: 'image_url', image_url: { url: `data:${image.mimetype};base64,${image.base64}` } }
+                        ]
+                    }]
+                })
+            });
+            return extractChatCompletionText(JSON.parse(raw));
+        }
+
         const endpoint = connection.endpoint || (connection.model ? `https://api-inference.huggingface.co/models/${connection.model}` : '');
         if (!endpoint) {
             return '';
@@ -593,6 +750,31 @@ async function analyzeContent(file, text, filePath, capability, settings) {
                 throw new Error('A HuggingFace endpoint or model is required.');
             }
 
+            if (isOpenAiCompatibleEndpoint(endpoint)) {
+                const image = settings.features.imageRecognition ? await maybeImagePayload(file, filePath, capability) : null;
+                const raw = await postRequest(chatCompletionsEndpoint(endpoint, 'https://router.huggingface.co/v1'), {
+                    headers: { Authorization: `Bearer ${settings.provider.apiKey}`, 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        model: settings.provider.model,
+                        temperature: 0.2,
+                        messages: [
+                            { role: 'system', content: 'Return valid JSON only.' },
+                            {
+                                role: 'user',
+                                content: image
+                                    ? [{ type: 'text', text: prompt }, { type: 'image_url', image_url: { url: `data:${image.mimetype};base64,${image.base64}` } }]
+                                    : prompt
+                            }
+                        ]
+                    })
+                });
+                return normalizeAnalysis(parseJsonObject(extractChatCompletionText(JSON.parse(raw))), {
+                    provider: 'huggingface',
+                    model: settings.provider.model || endpoint,
+                    imageRecognized: !!image
+                });
+            }
+
             const raw = await postRequest(endpoint, {
                 headers: { Authorization: `Bearer ${settings.provider.apiKey}`, 'Content-Type': 'application/json' },
                 body: JSON.stringify({ inputs: prompt })
@@ -680,7 +862,11 @@ app.post('/api/content-intelligence/analyze', async (req, res) => {
                 textExcerpt: truncate(searchableText, 1200),
                 textLength: searchableText.length,
                 method: extraction.method,
-                ocrApplied: extraction.ocrApplied === true
+                ocrApplied: extraction.ocrApplied === true,
+                ocrProvider: extraction.ocrProvider || null,
+                ocrModel: extraction.ocrModel || null,
+                ocrFallbackApplied: extraction.ocrFallbackApplied === true,
+                ocrError: extraction.ocrError || null
             },
             analysis
         });
